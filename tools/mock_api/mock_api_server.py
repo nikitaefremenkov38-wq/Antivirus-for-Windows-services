@@ -131,7 +131,7 @@ class MockHandler(BaseHTTPRequestHandler):
                 json_response(self, 400, {"error": "invalid_activation_code"})
                 return
 
-            expires_at = int(time.time()) + 3600
+            expires_at = int(time.time()) + 600
             STATE["license_by_user"][subject] = {
                 "licenseTicket": f"ticket-{subject}-{expires_at}",
                 "expiresAtUnix": expires_at,
@@ -151,6 +151,11 @@ class MockHandler(BaseHTTPRequestHandler):
             license_info = STATE["license_by_user"].get(subject)
             if not license_info:
                 json_response(self, 404, {"error": "no_license"})
+                return
+
+            if license_info.get("expiresAtUnix", 0) <= int(time.time()):
+                del STATE["license_by_user"][subject]
+                json_response(self, 404, {"error": "license_expired"})
                 return
 
             json_response(self, 200, license_info)

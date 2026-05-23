@@ -111,4 +111,168 @@ bool ActivateRemoteProduct(const std::wstring& activationCode) {
     return InvokeRpc([&] { return ActivateProduct(const_cast<wchar_t*>(activationCode.c_str())); });
 }
 
+bool GetRemoteAvBasesInfo(RemoteAvBasesInfo* info) {
+    if (info == nullptr) {
+        return false;
+    }
+
+    int loaded = 0;
+    unsigned long recordCount = 0;
+    hyper releaseDate = 0;
+    if (!InvokeRpc([&] { return GetAvBasesInfo(&loaded, &releaseDate, &recordCount); })) {
+        return false;
+    }
+
+    info->loaded = loaded != 0;
+    info->releaseDateUnix = static_cast<uint64_t>(releaseDate);
+    info->recordCount = static_cast<uint32_t>(recordCount);
+    return true;
+}
+
+bool ScanRemoteFile(const std::wstring& path, RemoteScanResult* result) {
+    if (result == nullptr) {
+        return false;
+    }
+
+    wchar_t details[4096]{};
+    int malicious = 0;
+    unsigned long scanned = 0;
+    unsigned long bad = 0;
+    unsigned long failed = 0;
+    if (!InvokeRpc([&] { return ScanFile(const_cast<wchar_t*>(path.c_str()), &malicious, &scanned, &bad, &failed, details, ARRAYSIZE(details)); })) {
+        return false;
+    }
+
+    result->malicious = malicious != 0;
+    result->scannedObjects = scanned;
+    result->maliciousObjects = bad;
+    result->failedObjects = failed;
+    result->details = details;
+    return true;
+}
+
+bool ScanRemoteDirectory(const std::wstring& path, RemoteScanResult* result) {
+    if (result == nullptr) {
+        return false;
+    }
+
+    wchar_t details[4096]{};
+    unsigned long scanned = 0;
+    unsigned long bad = 0;
+    unsigned long failed = 0;
+    if (!InvokeRpc([&] { return ScanDirectory(const_cast<wchar_t*>(path.c_str()), &scanned, &bad, &failed, details, ARRAYSIZE(details)); })) {
+        return false;
+    }
+
+    result->malicious = bad != 0;
+    result->scannedObjects = scanned;
+    result->maliciousObjects = bad;
+    result->failedObjects = failed;
+    result->details = details;
+    return true;
+}
+
+bool ScanRemoteFixedDrives(RemoteScanResult* result) {
+    if (result == nullptr) {
+        return false;
+    }
+
+    wchar_t details[4096]{};
+    unsigned long scanned = 0;
+    unsigned long bad = 0;
+    unsigned long failed = 0;
+    if (!InvokeRpc([&] { return ScanFixedDrives(&scanned, &bad, &failed, details, ARRAYSIZE(details)); })) {
+        return false;
+    }
+
+    result->malicious = bad != 0;
+    result->scannedObjects = scanned;
+    result->maliciousObjects = bad;
+    result->failedObjects = failed;
+    result->details = details;
+    return true;
+}
+
+bool StartRemoteDirectoryScan(const std::wstring& path, unsigned long* rpcStatus) {
+    return InvokeRpc([&] { return StartScanDirectory(const_cast<wchar_t*>(path.c_str())); }, rpcStatus);
+}
+
+bool StartRemoteFixedDrivesScan(unsigned long* rpcStatus) {
+    return InvokeRpc([] { return StartScanFixedDrives(); }, rpcStatus);
+}
+
+bool GetRemoteScanProgress(RemoteScanProgress* info, unsigned long* rpcStatus) {
+    if (info == nullptr) {
+        return false;
+    }
+
+    int running = 0;
+    int hasResult = 0;
+    unsigned long total = 0;
+    unsigned long completed = 0;
+    unsigned long bad = 0;
+    unsigned long failed = 0;
+    wchar_t currentPath[512]{};
+    wchar_t details[4096]{};
+    if (!InvokeRpc([&] {
+            return GetScanProgress(&running, &hasResult, &total, &completed, &bad, &failed,
+                                   currentPath, ARRAYSIZE(currentPath), details, ARRAYSIZE(details));
+        }, rpcStatus)) {
+        return false;
+    }
+
+    info->running = running != 0;
+    info->hasResult = hasResult != 0;
+    info->totalObjects = total;
+    info->completedObjects = completed;
+    info->maliciousObjects = bad;
+    info->failedObjects = failed;
+    info->currentPath = currentPath;
+    info->details = details;
+    return true;
+}
+
+bool SetRemoteScheduledScan(bool enabled, uint32_t intervalMinutes) {
+    return InvokeRpc([&] { return SetScheduledScan(enabled ? 1 : 0, intervalMinutes); });
+}
+
+bool GetRemoteScheduledScan(RemoteScheduleInfo* info) {
+    if (info == nullptr) {
+        return false;
+    }
+
+    int enabled = 0;
+    unsigned long interval = 0;
+    hyper nextRun = 0;
+    if (!InvokeRpc([&] { return GetScheduledScan(&enabled, &interval, &nextRun); })) {
+        return false;
+    }
+
+    info->enabled = enabled != 0;
+    info->intervalMinutes = interval;
+    info->nextRunUnix = static_cast<uint64_t>(nextRun);
+    return true;
+}
+
+bool AddRemoteMonitorDirectory(const std::wstring& path) {
+    return InvokeRpc([&] { return AddMonitorDirectory(const_cast<wchar_t*>(path.c_str())); });
+}
+
+bool ClearRemoteMonitorDirectories() {
+    return InvokeRpc([] { return ClearMonitorDirectories(); });
+}
+
+bool GetRemoteMonitorDirectories(std::wstring* directories) {
+    if (directories == nullptr) {
+        return false;
+    }
+
+    wchar_t buffer[4096]{};
+    if (!InvokeRpc([&] { return GetMonitorDirectories(buffer, ARRAYSIZE(buffer)); })) {
+        return false;
+    }
+    *directories = buffer;
+    return true;
+}
+
 }  // namespace tray
