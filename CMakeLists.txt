@@ -71,12 +71,14 @@ target_link_libraries(tray-rpc PUBLIC Rpcrt4)
 apply_static_msvc_runtime(tray-rpc)
 
 add_library(tray-common STATIC
+    src/av/av_engine.cpp
     src/common/service_utils.cpp
     src/common/json_utils.cpp
     src/common/rpc_client.cpp
     src/network/http_client.cpp
 )
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES
+    src/av/av_engine.cpp
     src/common/service_utils.cpp
     src/common/json_utils.cpp
     src/common/rpc_client.cpp
@@ -86,21 +88,32 @@ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES
 target_include_directories(tray-common
     PUBLIC
         "${RPC_GENERATED_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/av"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/common"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/network"
 )
 
-target_link_libraries(tray-common PUBLIC Advapi32 Crypt32 Rpcrt4 Winhttp tray-rpc)
+target_link_libraries(tray-common PUBLIC Advapi32 Bcrypt Crypt32 Rpcrt4 Winhttp tray-rpc)
+target_compile_definitions(tray-common PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 apply_static_msvc_runtime(tray-common)
 
 add_executable(tray-app WIN32 src/app/tray_app.cpp)
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES src/app/tray_app.cpp)
 target_compile_definitions(tray-app PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(tray-app PRIVATE tray-common)
+target_link_libraries(tray-app PRIVATE tray-common Comdlg32 Ole32 Shell32)
+target_compile_options(tray-app PRIVATE /utf-8)
 apply_static_msvc_runtime(tray-app)
 
 add_executable(tray-service src/service/service_main.cpp)
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES src/service/service_main.cpp)
 target_compile_definitions(tray-service PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(tray-service PRIVATE tray-common tray-rpc Advapi32 Userenv Wtsapi32)
+target_compile_options(tray-service PRIVATE /utf-8)
 apply_static_msvc_runtime(tray-service)
+
+add_executable(tray-control src/tools/tray_control.cpp)
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES src/tools/tray_control.cpp)
+target_compile_definitions(tray-control PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(tray-control PRIVATE tray-common Advapi32)
+target_compile_options(tray-control PRIVATE /utf-8)
+apply_static_msvc_runtime(tray-control)

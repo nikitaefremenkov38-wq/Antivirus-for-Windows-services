@@ -15,5 +15,7 @@ enum class ServiceBootResult {
 ServiceBootResult EnsureServiceRunning(DWORD timeout_ms);
 bool IsParentProcessService();
 std::wstring GetExecutableDirectory();
+bool ProtectCurrentProcessFromTermination();
+bool ProtectProcessFromTermination(HANDLE process);
 
 }  // namespace tray
