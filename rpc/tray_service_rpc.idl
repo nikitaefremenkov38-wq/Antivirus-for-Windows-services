@@ -1,0 +1,10 @@
+[
+    uuid(4FB6A677-3F42-4A1E-90A9-BD40DB95BAFD),
+    version(1.0),
+    implicit_handle(handle_t tray_service_binding),
+    pointer_default(unique)
+]
+interface TrayServiceRpc
+{
+    error_status_t StopService();
+}
