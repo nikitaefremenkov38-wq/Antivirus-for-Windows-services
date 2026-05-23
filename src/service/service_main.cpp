@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -108,6 +109,9 @@ ScanJobState g_scanJobState;
 
 constexpr unsigned long kScanDetailsCapacity = 4096;
 constexpr size_t kMaxReportedScanLines = 40;
+constexpr wchar_t kPrimaryBasesFileName[] = L"avbases.bin";
+constexpr wchar_t kBackupBasesFileName[] = L"avbases.bin.bak";
+constexpr wchar_t kDefaultBasesFileName[] = L"default_avbases.bin";
 
 std::wstring ToLowerCopy(std::wstring text) {
     std::transform(text.begin(), text.end(), text.begin(), towlower);
@@ -222,6 +226,40 @@ std::wstring BuildTrayAppPath() {
     }
     path += tray::kTrayAppProcessName;
     return path;
+}
+
+std::wstring BuildBasesDirectoryPath() {
+    std::wstring path = tray::GetExecutableDirectory();
+    if (!path.empty()) {
+        path += L"\\";
+    }
+    path += L"bases";
+    return path;
+}
+
+std::wstring BuildBasesFilePath(const std::wstring& directory, const wchar_t* fileName) {
+    std::wstring path = directory;
+    if (!path.empty() && path.back() != L'\\') {
+        path += L"\\";
+    }
+    path += fileName;
+    return path;
+}
+
+void EnsureDirectoryRecursive(const std::wstring& directory) {
+    if (directory.empty()) {
+        return;
+    }
+    std::error_code ignored;
+    fs::create_directories(directory, ignored);
+}
+
+bool CopyFileOverwrite(const std::wstring& source, const std::wstring& target) {
+    EnsureDirectoryRecursive(fs::path(target).parent_path().wstring());
+    if (!CopyFileW(source.c_str(), target.c_str(), FALSE)) {
+        return false;
+    }
+    return true;
 }
 
 bool StoreTokens(const std::string& body, const std::wstring* explicitUserName = nullptr) {
@@ -340,15 +378,42 @@ LicenseFetchResult FetchLicenseStatus() {
 }
 
 bool LoadAvBases() {
-    EnterCriticalSection(&g_stateLock);
-    const bool licenseAvailable = g_licenseState.hasLicense;
-    LeaveCriticalSection(&g_stateLock);
-    if (!licenseAvailable) {
-        return false;
+    EnterCriticalSection(&g_avLock);
+    const std::wstring basesDirectory = BuildBasesDirectoryPath();
+    EnsureDirectoryRecursive(basesDirectory);
+
+    const std::wstring primaryPath = BuildBasesFilePath(basesDirectory, kPrimaryBasesFileName);
+    const std::wstring backupPath = BuildBasesFilePath(basesDirectory, kBackupBasesFileName);
+    const std::wstring defaultPath = BuildBasesFilePath(basesDirectory, kDefaultBasesFileName);
+
+    if (!fs::exists(defaultPath)) {
+        g_avEngine.SaveDefaultBasesToFile(defaultPath);
     }
 
-    EnterCriticalSection(&g_avLock);
-    const bool loaded = g_avEngine.LoadDemoBases();
+    tray::AvLoadStats loadStats{};
+    tray::AvLoadResult loadResult = g_avEngine.LoadBasesFromFile(primaryPath, &loadStats);
+    bool loaded = loadResult == tray::AvLoadResult::Success;
+
+    if (!loaded) {
+        loadResult = g_avEngine.LoadBasesFromFile(backupPath, &loadStats);
+        loaded = loadResult == tray::AvLoadResult::Success;
+        if (loaded) {
+            CopyFileOverwrite(backupPath, primaryPath);
+        }
+    }
+
+    if (!loaded) {
+        loadResult = g_avEngine.LoadBasesFromFile(defaultPath, &loadStats);
+        loaded = loadResult == tray::AvLoadResult::Success;
+        if (loaded) {
+            CopyFileOverwrite(defaultPath, primaryPath);
+        }
+    }
+
+    if (loaded && fs::exists(primaryPath)) {
+        CopyFileOverwrite(primaryPath, backupPath);
+    }
+
     if (loaded && g_scheduleState.enabled && g_scheduleState.nextRunUnix == 0) {
         g_scheduleState.nextRunUnix = NowUnix() + static_cast<uint64_t>(g_scheduleState.intervalMinutes) * 60;
     }
@@ -1216,6 +1281,7 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
         return;
     }
 
+    LoadAvBases();
     LaunchTrayAppInKnownSessions();
     g_sessionWatchThread = CreateThread(nullptr, 0, SessionWatchThreadProc, nullptr, 0, nullptr);
     g_stateWatchThread = CreateThread(nullptr, 0, StateWatchThreadProc, nullptr, 0, nullptr);
