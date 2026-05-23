@@ -37,6 +37,22 @@ struct AvBasesInfo {
     uint32_t recordCount{};
 };
 
+enum class AvLoadResult : uint32_t {
+    Success = 0,
+    FileMissing = 1,
+    IoError = 2,
+    FormatError = 3,
+    ManifestInvalid = 4,
+    NoValidRecords = 5,
+};
+
+struct AvLoadStats {
+    uint32_t totalRecords{};
+    uint32_t loadedRecords{};
+    uint32_t rejectedRecords{};
+    bool manifestValid{};
+};
+
 struct ScanMatchInfo {
     bool malicious{false};
     AvObjectType objectType{AvObjectType::Unknown};
@@ -54,6 +70,8 @@ struct ScanSummary {
 class AvEngine {
 public:
     bool LoadDemoBases();
+    bool SaveDefaultBasesToFile(const std::wstring& path) const;
+    AvLoadResult LoadBasesFromFile(const std::wstring& path, AvLoadStats* stats);
     void Clear();
 
     bool HasBases() const;
@@ -65,6 +83,7 @@ public:
     static std::wstring ObjectTypeToText(AvObjectType objectType);
 
 private:
+    void AddRecord(const AvRecord& record);
     bool AddRecord(const std::vector<uint8_t>& signatureBytes,
                    uint64_t offsetBegin,
                    uint64_t offsetEnd,
