@@ -1,4 +1,4 @@
-#include "service_utils.h"
+﻿#include "service_utils.h"
 
 #include "service_config.h"
 
@@ -11,15 +11,9 @@ namespace {
 bool QueryServiceState(SC_HANDLE service, DWORD* state) {
     SERVICE_STATUS_PROCESS status{};
     DWORD bytes_needed = 0;
-    if (!QueryServiceStatusEx(
-            service,
-            SC_STATUS_PROCESS_INFO,
-            reinterpret_cast<LPBYTE>(&status),
-            sizeof(status),
-            &bytes_needed)) {
+    if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytes_needed)) {
         return false;
     }
-
     *state = status.dwCurrentState;
     return true;
 }
@@ -27,20 +21,16 @@ bool QueryServiceState(SC_HANDLE service, DWORD* state) {
 bool WaitForServiceState(SC_HANDLE service, DWORD target_state, DWORD timeout_ms) {
     const DWORD start_tick = GetTickCount();
     DWORD current_state = SERVICE_STOPPED;
-
     while (true) {
         if (!QueryServiceState(service, &current_state)) {
             return false;
         }
-
         if (current_state == target_state) {
             return true;
         }
-
         if (GetTickCount() - start_tick >= timeout_ms) {
             return false;
         }
-
         Sleep(250);
     }
 }
@@ -60,7 +50,6 @@ std::wstring GetProcessBaseName(DWORD process_id) {
 
     CloseHandle(process);
     path.resize(size);
-
     const size_t slash = path.find_last_of(L"\\/");
     return slash == std::wstring::npos ? path : path.substr(slash + 1);
 }
@@ -99,12 +88,7 @@ ServiceBootResult EnsureServiceRunning(DWORD timeout_ms) {
         return ServiceBootResult::kFailed;
     }
 
-    SC_HANDLE service = OpenServiceW(
-        scm,
-        kServiceName,
-        SERVICE_QUERY_STATUS | SERVICE_START
-    );
-
+    SC_HANDLE service = OpenServiceW(scm, kServiceName, SERVICE_QUERY_STATUS);
     if (service == nullptr) {
         CloseServiceHandle(scm);
         return ServiceBootResult::kFailed;
@@ -121,6 +105,13 @@ ServiceBootResult EnsureServiceRunning(DWORD timeout_ms) {
     if (state == SERVICE_RUNNING) {
         result = ServiceBootResult::kRunningAlready;
     } else {
+        CloseServiceHandle(service);
+        service = OpenServiceW(scm, kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+        if (service == nullptr) {
+            CloseServiceHandle(scm);
+            return ServiceBootResult::kFailed;
+        }
+
         if (state == SERVICE_STOPPED) {
             StartServiceW(service, 0, nullptr);
         }
@@ -140,7 +131,6 @@ bool IsParentProcessService() {
     if (parent_process_id == 0) {
         return false;
     }
-
     const std::wstring parent_name = GetProcessBaseName(parent_process_id);
     return _wcsicmp(parent_name.c_str(), kServiceProcessName) == 0;
 }

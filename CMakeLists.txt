@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
 project(tray_solution LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
@@ -54,36 +54,53 @@ add_library(tray-rpc STATIC
     "${RPC_GENERATED_SERVER}"
     src/common/rpc_memory.cpp
 )
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES
+    "${RPC_GENERATED_CLIENT}"
+    "${RPC_GENERATED_SERVER}"
+    src/common/rpc_memory.cpp
+)
 
 target_include_directories(tray-rpc
     PUBLIC
         "${RPC_GENERATED_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/common"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/network"
 )
 
 target_link_libraries(tray-rpc PUBLIC Rpcrt4)
 apply_static_msvc_runtime(tray-rpc)
 
 add_library(tray-common STATIC
-    src/common/rpc_client.cpp
     src/common/service_utils.cpp
+    src/common/json_utils.cpp
+    src/common/rpc_client.cpp
+    src/network/http_client.cpp
+)
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES
+    src/common/service_utils.cpp
+    src/common/json_utils.cpp
+    src/common/rpc_client.cpp
+    src/network/http_client.cpp
 )
 
 target_include_directories(tray-common
     PUBLIC
         "${RPC_GENERATED_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/common"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/network"
 )
 
-target_link_libraries(tray-common PUBLIC Advapi32 Rpcrt4 tray-rpc)
+target_link_libraries(tray-common PUBLIC Advapi32 Crypt32 Rpcrt4 Winhttp tray-rpc)
 apply_static_msvc_runtime(tray-common)
 
 add_executable(tray-app WIN32 src/app/tray_app.cpp)
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES src/app/tray_app.cpp)
 target_compile_definitions(tray-app PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(tray-app PRIVATE tray-common)
 apply_static_msvc_runtime(tray-app)
 
 add_executable(tray-service src/service/service_main.cpp)
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "Source Files" FILES src/service/service_main.cpp)
 target_compile_definitions(tray-service PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(tray-service PRIVATE tray-common tray-rpc Advapi32 Userenv Wtsapi32)
 apply_static_msvc_runtime(tray-service)
