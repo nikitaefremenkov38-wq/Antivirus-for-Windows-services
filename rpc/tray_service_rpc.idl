@@ -1,4 +1,4 @@
-[
+﻿[
     uuid(4FB6A677-3F42-4A1E-90A9-BD40DB95BAFD),
     version(1.0),
     implicit_handle(handle_t tray_service_binding),
@@ -7,4 +7,26 @@
 interface TrayServiceRpc
 {
     error_status_t StopService();
+
+    error_status_t GetCurrentUserInfo(
+        [out] int* authenticated,
+        [out, string, size_is(userNameCapacity)] wchar_t* userName,
+        [in] unsigned long userNameCapacity
+    );
+
+    error_status_t LoginUser(
+        [in, string] const wchar_t* userName,
+        [in, string] const wchar_t* password
+    );
+
+    error_status_t LogoutUser();
+
+    error_status_t GetLicenseInfo(
+        [out] int* hasLicense,
+        [out] hyper* expiresAtUnix
+    );
+
+    error_status_t ActivateProduct(
+        [in, string] const wchar_t* activationCode
+    );
 }
