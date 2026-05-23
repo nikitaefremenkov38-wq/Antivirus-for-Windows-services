@@ -34,3 +34,26 @@ jobs:
           name: tray-service-windows-x64
           path: build/Release/tray-service.exe
           if-no-files-found: error
+
+      - name: Upload tray control artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tray-control-windows-x64
+          path: build/Release/tray-control.exe
+          if-no-files-found: error
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DMyBuildDir=$((Resolve-Path build/Release).Path)" `
+            "installer/tray-antivirus.iss"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tray-antivirus-installer
+          path: build/Release/tray-antivirus-setup.exe
+          if-no-files-found: error

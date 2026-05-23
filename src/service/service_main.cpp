@@ -1,5 +1,6 @@
 ﻿#include <windows.h>
 
+#include "av_engine.h"
 #include "json_utils.h"
 #include "http_client.h"
 #include "service_config.h"
@@ -10,8 +11,13 @@
 #include <userenv.h>
 #include <wtsapi32.h>
 
+#include <algorithm>
+#include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -43,23 +49,106 @@ struct LaunchedProcess {
     HANDLE processHandle{};
 };
 
+struct ScanSummaryInternal {
+    uint32_t scannedObjects{};
+    uint32_t maliciousObjects{};
+    uint32_t failedObjects{};
+    std::wstring details;
+};
+
+struct ScheduledScanState {
+    bool enabled{false};
+    uint32_t intervalMinutes{60};
+    uint64_t nextRunUnix{};
+    std::wstring lastSummary;
+};
+
+struct MonitorState {
+    std::vector<std::wstring> directories;
+    std::map<std::wstring, uint64_t> knownWriteTimes;
+    std::wstring lastSummary;
+};
+
+enum class ScanJobKind {
+    None,
+    Directory,
+    FixedDrives,
+};
+
+struct ScanJobState {
+    bool running{false};
+    bool hasResult{false};
+    ScanJobKind kind{ScanJobKind::None};
+    std::wstring targetPath;
+    uint32_t totalObjects{};
+    uint32_t completedObjects{};
+    uint32_t maliciousObjects{};
+    uint32_t failedObjects{};
+    std::wstring currentPath;
+    std::wstring details;
+};
+
 SERVICE_STATUS_HANDLE g_serviceStatusHandle = nullptr;
 SERVICE_STATUS g_serviceStatus{};
 CRITICAL_SECTION g_processLock{};
 CRITICAL_SECTION g_stateLock{};
+CRITICAL_SECTION g_avLock{};
+CRITICAL_SECTION g_scanLock{};
 HANDLE g_stopEvent = nullptr;
 HANDLE g_sessionWatchThread = nullptr;
 HANDLE g_stateWatchThread = nullptr;
+HANDLE g_scanJobThread = nullptr;
 std::vector<LaunchedProcess> g_launchedProcesses;
 AuthState g_authState;
 LicenseState g_licenseState;
+tray::AvEngine g_avEngine;
+ScheduledScanState g_scheduleState;
+MonitorState g_monitorState;
+ScanJobState g_scanJobState;
+
+constexpr unsigned long kScanDetailsCapacity = 4096;
+constexpr size_t kMaxReportedScanLines = 40;
+
+std::wstring ToLowerCopy(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), towlower);
+    return text;
+}
+
+bool HasTargetExtension(const std::wstring& path) {
+    const std::wstring extension = ToLowerCopy(fs::path(path).extension().wstring());
+    return extension == L".exe" || extension == L".dll" || extension == L".sys" || extension == L".scr" ||
+           extension == L".com" || extension == L".ps1" || extension == L".psm1" || extension == L".psd1" ||
+           extension == L".bat" || extension == L".cmd" || extension == L".js" || extension == L".jse" ||
+           extension == L".vbs" || extension == L".vbe" || extension == L".wsf" || extension == L".wsh" ||
+           extension == L".py" || extension == L".pyw" || extension == L".jar" || extension == L".class" ||
+           extension == L".txt";
+}
+
+bool IsReparsePoint(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+bool ShouldSkipDirectory(const std::wstring& path, bool fixedDriveMode) {
+    const std::wstring name = ToLowerCopy(fs::path(path).filename().wstring());
+    if (name == L"appdata" || name == L"node_modules" || name == L".git" || name == L".vs" ||
+        name == L"build" || name == L"cmake-build-debug" || name == L"cmake-build-release") {
+        return true;
+    }
+    if (fixedDriveMode && (name == L"windows" || name == L"program files" || name == L"program files (x86)" ||
+                           name == L"programdata" || name == L"$recycle.bin" || name == L"system volume information" ||
+                           name == L"recovery")) {
+        return true;
+    }
+    return IsReparsePoint(path);
+}
 
 uint64_t NowUnix() {
-    FILETIME file_time{};
-    GetSystemTimeAsFileTime(&file_time);
+    FILETIME fileTime{};
+    GetSystemTimeAsFileTime(&fileTime);
     ULARGE_INTEGER value{};
-    value.LowPart = file_time.dwLowDateTime;
-    value.HighPart = file_time.dwHighDateTime;
+    value.LowPart = fileTime.dwLowDateTime;
+    value.HighPart = fileTime.dwHighDateTime;
     return (value.QuadPart - 116444736000000000ULL) / 10000000ULL;
 }
 
@@ -71,6 +160,24 @@ uint64_t CalculateRefreshMoment(uint64_t expiresAt) {
     return expiresAt - 60;
 }
 
+void AppendSummaryLine(std::wstring* target, const std::wstring& line) {
+    if (target == nullptr || line.empty()) {
+        return;
+    }
+    if (!target->empty()) {
+        *target += L"\r\n";
+    }
+    *target += line;
+}
+
+void ClearAvStateLocked() {
+    g_avEngine.Clear();
+    g_scheduleState.nextRunUnix = 0;
+    g_scheduleState.lastSummary.clear();
+    g_monitorState.knownWriteTimes.clear();
+    g_monitorState.lastSummary.clear();
+}
+
 void ClearLicenseLocked() {
     g_licenseState = {};
 }
@@ -78,6 +185,16 @@ void ClearLicenseLocked() {
 void ClearAuthLocked() {
     g_authState = {};
     ClearLicenseLocked();
+}
+
+void ClearAuthAndAvState() {
+    EnterCriticalSection(&g_stateLock);
+    ClearAuthLocked();
+    LeaveCriticalSection(&g_stateLock);
+
+    EnterCriticalSection(&g_avLock);
+    ClearAvStateLocked();
+    LeaveCriticalSection(&g_avLock);
 }
 
 void SetServiceState(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD waitHint = 0) {
@@ -222,6 +339,23 @@ LicenseFetchResult FetchLicenseStatus() {
     return StoreLicense(response.body) ? LicenseFetchResult::kSuccess : LicenseFetchResult::kFailed;
 }
 
+bool LoadAvBases() {
+    EnterCriticalSection(&g_stateLock);
+    const bool licenseAvailable = g_licenseState.hasLicense;
+    LeaveCriticalSection(&g_stateLock);
+    if (!licenseAvailable) {
+        return false;
+    }
+
+    EnterCriticalSection(&g_avLock);
+    const bool loaded = g_avEngine.LoadDemoBases();
+    if (loaded && g_scheduleState.enabled && g_scheduleState.nextRunUnix == 0) {
+        g_scheduleState.nextRunUnix = NowUnix() + static_cast<uint64_t>(g_scheduleState.intervalMinutes) * 60;
+    }
+    LeaveCriticalSection(&g_avLock);
+    return loaded;
+}
+
 bool ActivateLicense(const std::wstring& code) {
     EnterCriticalSection(&g_stateLock);
     if (!g_authState.authenticated || g_authState.accessToken.empty()) {
@@ -239,10 +373,330 @@ bool ActivateLicense(const std::wstring& code) {
     if (response.statusCode != 200 && response.statusCode != 204) {
         return false;
     }
-    if (response.statusCode == 200 && !response.body.empty() && StoreLicense(response.body)) {
-        return true;
+
+    bool activated = false;
+    if (response.statusCode == 200 && !response.body.empty()) {
+        activated = StoreLicense(response.body);
+    } else {
+        activated = FetchLicenseStatus() == LicenseFetchResult::kSuccess;
     }
-    return FetchLicenseStatus() == LicenseFetchResult::kSuccess;
+    if (!activated) {
+        return false;
+    }
+    return LoadAvBases();
+}
+
+bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>* bytes) {
+    bytes->clear();
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 || size.QuadPart > static_cast<LONGLONG>(64 * 1024 * 1024)) {
+        CloseHandle(file);
+        return false;
+    }
+
+    bytes->resize(static_cast<size_t>(size.QuadPart));
+    DWORD readBytes = 0;
+    const BOOL readOk = bytes->empty() || ReadFile(file, bytes->data(), static_cast<DWORD>(bytes->size()), &readBytes, nullptr);
+    CloseHandle(file);
+    if (!readOk || readBytes != bytes->size()) {
+        bytes->clear();
+        return false;
+    }
+    return true;
+}
+
+uint64_t GetFileWriteTimeStamp(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        return 0;
+    }
+    ULARGE_INTEGER value{};
+    value.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    value.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    return value.QuadPart;
+}
+
+bool CanUseAvFeatures() {
+    EnterCriticalSection(&g_stateLock);
+    const bool hasLicense = g_authState.authenticated && g_licenseState.hasLicense;
+    LeaveCriticalSection(&g_stateLock);
+    if (!hasLicense) {
+        return false;
+    }
+
+    EnterCriticalSection(&g_avLock);
+    const bool hasBases = g_avEngine.HasBases();
+    LeaveCriticalSection(&g_avLock);
+    return hasBases;
+}
+
+void AppendScanFinding(ScanSummaryInternal* summary, const std::wstring& line) {
+    if (summary == nullptr) {
+        return;
+    }
+    size_t lines = 0;
+    for (wchar_t ch : summary->details) {
+        if (ch == L'\n') {
+            ++lines;
+        }
+    }
+    if (lines >= kMaxReportedScanLines) {
+        return;
+    }
+    AppendSummaryLine(&summary->details, line);
+}
+
+std::wstring BuildScanSummaryText(const std::wstring& caption, const ScanSummaryInternal& summary) {
+    std::wstring text = caption + L"\r\n";
+    text += L"Проверено объектов: " + std::to_wstring(summary.scannedObjects) + L"\r\n";
+    text += L"Обнаружено угроз: " + std::to_wstring(summary.maliciousObjects) + L"\r\n";
+    text += L"Ошибок чтения: " + std::to_wstring(summary.failedObjects);
+    if (!summary.details.empty()) {
+        text += L"\r\n\r\nПодробности:\r\n" + summary.details;
+    }
+    return text;
+}
+
+void ScanSingleFileInternal(const std::wstring& path, ScanSummaryInternal* summary) {
+    summary->scannedObjects += 1;
+
+    if (!HasTargetExtension(path)) {
+        return;
+    }
+
+    std::vector<uint8_t> bytes;
+    if (!ReadFileBytes(path, &bytes)) {
+        summary->failedObjects += 1;
+        AppendScanFinding(summary, path + L" -> ошибка чтения");
+        return;
+    }
+
+    const auto objectType = tray::AvEngine::DetectObjectType(path, bytes);
+    tray::ScanMatchInfo match;
+    EnterCriticalSection(&g_avLock);
+    match = g_avEngine.ScanBytes(bytes, objectType);
+    LeaveCriticalSection(&g_avLock);
+
+    if (match.malicious) {
+        summary->maliciousObjects += 1;
+        AppendScanFinding(summary, path + L" -> вредоносный объект: " + match.threatName + L" (" + tray::AvEngine::ObjectTypeToText(match.objectType) + L")");
+    }
+}
+
+void CollectScannableFiles(const std::wstring& rootPath, bool fixedDriveMode, std::vector<std::wstring>* files, ScanSummaryInternal* summary) {
+    std::error_code error;
+    if (!fs::exists(rootPath, error) || !fs::is_directory(rootPath, error)) {
+        summary->failedObjects += 1;
+        AppendScanFinding(summary, rootPath + L" -> директория недоступна");
+        return;
+    }
+
+    fs::recursive_directory_iterator iterator(rootPath, fs::directory_options::skip_permission_denied, error);
+    fs::recursive_directory_iterator end;
+    while (iterator != end) {
+        if (error) {
+            error.clear();
+            ++iterator;
+            continue;
+        }
+
+        const fs::directory_entry entry = *iterator;
+        const std::wstring currentPath = entry.path().wstring();
+        std::error_code entryError;
+        if (entry.is_directory(entryError)) {
+            if (ShouldSkipDirectory(currentPath, fixedDriveMode)) {
+                iterator.disable_recursion_pending();
+            }
+        } else if (!entryError && entry.is_regular_file(entryError)) {
+            if (HasTargetExtension(currentPath)) {
+                files->push_back(currentPath);
+            }
+        }
+        ++iterator;
+    }
+}
+
+void UpdateScanJobProgress(const std::wstring& currentPath, const ScanSummaryInternal& summary, uint32_t totalObjects, uint32_t completedObjects) {
+    EnterCriticalSection(&g_scanLock);
+    g_scanJobState.totalObjects = totalObjects;
+    g_scanJobState.completedObjects = completedObjects;
+    g_scanJobState.maliciousObjects = summary.maliciousObjects;
+    g_scanJobState.failedObjects = summary.failedObjects;
+    g_scanJobState.currentPath = currentPath;
+    LeaveCriticalSection(&g_scanLock);
+}
+
+void ScanFileListInternal(const std::vector<std::wstring>& files, ScanSummaryInternal* summary) {
+    const uint32_t total = static_cast<uint32_t>(files.size());
+    for (uint32_t index = 0; index < total; ++index) {
+        UpdateScanJobProgress(files[index], *summary, total, index);
+        ScanSingleFileInternal(files[index], summary);
+        UpdateScanJobProgress(files[index], *summary, total, index + 1);
+        if (WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) {
+            break;
+        }
+    }
+}
+
+void ScanDirectoryInternal(const std::wstring& path, ScanSummaryInternal* summary) {
+    std::error_code error;
+    if (!fs::exists(path, error) || !fs::is_directory(path, error)) {
+        summary->failedObjects += 1;
+        AppendScanFinding(summary, path + L" -> директория недоступна");
+        return;
+    }
+
+    std::vector<std::wstring> files;
+    CollectScannableFiles(path, false, &files, summary);
+    ScanFileListInternal(files, summary);
+}
+
+void ScanFixedDrivesInternal(ScanSummaryInternal* summary) {
+    std::vector<std::wstring> files;
+    const DWORD drives = GetLogicalDrives();
+    for (int index = 0; index < 26; ++index) {
+        if ((drives & (1u << index)) == 0) {
+            continue;
+        }
+        wchar_t root[] = {static_cast<wchar_t>(L'A' + index), L':', L'\\', L'\0'};
+        if (GetDriveTypeW(root) == DRIVE_FIXED) {
+            CollectScannableFiles(root, true, &files, summary);
+        }
+    }
+    ScanFileListInternal(files, summary);
+}
+std::wstring JoinDirectories(const std::vector<std::wstring>& directories) {
+    std::wstring result;
+    for (size_t index = 0; index < directories.size(); ++index) {
+        if (!result.empty()) {
+            result += L";";
+        }
+        result += directories[index];
+    }
+    return result;
+}
+
+void PollMonitoredDirectories() {
+    if (!CanUseAvFeatures()) {
+        return;
+    }
+
+    std::vector<std::wstring> directories;
+    std::map<std::wstring, uint64_t> knownWriteTimes;
+    EnterCriticalSection(&g_avLock);
+    directories = g_monitorState.directories;
+    knownWriteTimes = g_monitorState.knownWriteTimes;
+    LeaveCriticalSection(&g_avLock);
+
+    ScanSummaryInternal summary;
+    std::map<std::wstring, uint64_t> updatedWriteTimes = knownWriteTimes;
+
+    for (const auto& directory : directories) {
+        std::error_code error;
+        if (!fs::exists(directory, error) || !fs::is_directory(directory, error)) {
+            continue;
+        }
+
+        for (const auto& entry : fs::recursive_directory_iterator(directory, fs::directory_options::skip_permission_denied, error)) {
+            if (error || !entry.is_regular_file(error)) {
+                continue;
+            }
+            const std::wstring path = entry.path().wstring();
+            const uint64_t writeTime = GetFileWriteTimeStamp(path);
+            const auto it = updatedWriteTimes.find(path);
+            if (it == updatedWriteTimes.end() || it->second != writeTime) {
+                ScanSingleFileInternal(path, &summary);
+                updatedWriteTimes[path] = writeTime;
+            }
+        }
+    }
+
+    EnterCriticalSection(&g_avLock);
+    g_monitorState.knownWriteTimes.swap(updatedWriteTimes);
+    if (!summary.details.empty()) {
+        g_monitorState.lastSummary = summary.details;
+    }
+    LeaveCriticalSection(&g_avLock);
+}
+
+void ResetScanJobStateLocked(ScanJobKind kind, const std::wstring& targetPath) {
+    g_scanJobState = {};
+    g_scanJobState.kind = kind;
+    g_scanJobState.targetPath = targetPath;
+    g_scanJobState.running = true;
+    g_scanJobState.currentPath = L"Подготовка списка файлов...";
+}
+
+void FinishScanJob(ScanSummaryInternal* summary, const std::wstring& caption) {
+    EnterCriticalSection(&g_scanLock);
+    g_scanJobState.running = false;
+    g_scanJobState.hasResult = true;
+    g_scanJobState.completedObjects = g_scanJobState.totalObjects;
+    g_scanJobState.maliciousObjects = summary->maliciousObjects;
+    g_scanJobState.failedObjects = summary->failedObjects;
+    g_scanJobState.currentPath.clear();
+    g_scanJobState.details = BuildScanSummaryText(caption, *summary);
+    LeaveCriticalSection(&g_scanLock);
+}
+
+struct ScanThreadContext {
+    ScanJobKind kind{ScanJobKind::None};
+    std::wstring path;
+};
+
+DWORD WINAPI ScanJobThreadProc(LPVOID parameter) {
+    std::unique_ptr<ScanThreadContext> context(reinterpret_cast<ScanThreadContext*>(parameter));
+    ScanSummaryInternal summary;
+
+    if (context->kind == ScanJobKind::Directory) {
+        ScanDirectoryInternal(context->path, &summary);
+        FinishScanJob(&summary, L"Сканирование папки завершено.");
+    } else if (context->kind == ScanJobKind::FixedDrives) {
+        ScanFixedDrivesInternal(&summary);
+        FinishScanJob(&summary, L"Сканирование дисков завершено.");
+    }
+
+    return 0;
+}
+
+error_status_t StartAsyncScanJob(ScanJobKind kind, const std::wstring& path) {
+    if (!CanUseAvFeatures()) {
+        return ERROR_NOT_FOUND;
+    }
+    if (kind == ScanJobKind::Directory) {
+        std::error_code error;
+        if (path.empty() || !fs::exists(path, error) || !fs::is_directory(path, error)) {
+            return ERROR_PATH_NOT_FOUND;
+        }
+    }
+
+    EnterCriticalSection(&g_scanLock);
+    if (g_scanJobState.running) {
+        LeaveCriticalSection(&g_scanLock);
+        return ERROR_BUSY;
+    }
+    if (g_scanJobThread != nullptr) {
+        CloseHandle(g_scanJobThread);
+        g_scanJobThread = nullptr;
+    }
+    ResetScanJobStateLocked(kind, path);
+    auto* context = new ScanThreadContext();
+    context->kind = kind;
+    context->path = path;
+    g_scanJobThread = CreateThread(nullptr, 0, ScanJobThreadProc, context, 0, nullptr);
+    if (g_scanJobThread == nullptr) {
+        delete context;
+        g_scanJobState = {};
+        LeaveCriticalSection(&g_scanLock);
+        return ERROR_GEN_FAILURE;
+    }
+    LeaveCriticalSection(&g_scanLock);
+    return ERROR_SUCCESS;
 }
 
 void CleanupDeadProcessesLocked() {
@@ -363,20 +817,53 @@ DWORD WINAPI StateWatchThreadProc(LPVOID) {
         const uint64_t now = NowUnix();
         bool refreshTokensNow = false;
         bool refreshLicenseNow = false;
+        bool shouldLoadBases = false;
+        bool shouldRunScheduledScan = false;
 
         EnterCriticalSection(&g_stateLock);
         refreshTokensNow = g_authState.authenticated && now >= g_authState.nextRefreshAttemptAt;
         refreshLicenseNow = g_authState.authenticated && g_licenseState.hasLicense && now >= g_licenseState.nextRefreshAttemptAt;
+        const bool licensed = g_authState.authenticated && g_licenseState.hasLicense;
         LeaveCriticalSection(&g_stateLock);
+
+        EnterCriticalSection(&g_avLock);
+        shouldLoadBases = licensed && !g_avEngine.HasBases();
+        shouldRunScheduledScan = licensed && g_avEngine.HasBases() && g_scheduleState.enabled && g_scheduleState.nextRunUnix != 0 && now >= g_scheduleState.nextRunUnix;
+        LeaveCriticalSection(&g_avLock);
 
         if (refreshTokensNow) {
             RefreshTokens();
         }
         if (refreshLicenseNow) {
-            FetchLicenseStatus();
+            const LicenseFetchResult result = FetchLicenseStatus();
+            if (result == LicenseFetchResult::kNoLicense) {
+                EnterCriticalSection(&g_avLock);
+                ClearAvStateLocked();
+                LeaveCriticalSection(&g_avLock);
+            }
         }
+        if (shouldLoadBases) {
+            LoadAvBases();
+        }
+        if (shouldRunScheduledScan) {
+            ScanSummaryInternal summary;
+            ScanFixedDrivesInternal(&summary);
+            EnterCriticalSection(&g_avLock);
+            g_scheduleState.lastSummary = summary.details;
+            g_scheduleState.nextRunUnix = NowUnix() + static_cast<uint64_t>(g_scheduleState.intervalMinutes) * 60;
+            LeaveCriticalSection(&g_avLock);
+        }
+        PollMonitoredDirectories();
     }
     return 0;
+}
+
+bool FillDetailsBuffer(const std::wstring& text, wchar_t* details, unsigned long capacity) {
+    if (details == nullptr || capacity == 0) {
+        return false;
+    }
+    wcsncpy_s(details, capacity, text.c_str(), _TRUNCATE);
+    return true;
 }
 
 extern "C" error_status_t StopService() {
@@ -404,9 +891,7 @@ extern "C" error_status_t LoginUser(const wchar_t* userName, const wchar_t* pass
 }
 
 extern "C" error_status_t LogoutUser() {
-    EnterCriticalSection(&g_stateLock);
-    ClearAuthLocked();
-    LeaveCriticalSection(&g_stateLock);
+    ClearAuthAndAvState();
     return ERROR_SUCCESS;
 }
 
@@ -440,18 +925,18 @@ extern "C" error_status_t GetLicenseInfo(int* hasLicense, hyper* expiresAtUnix) 
     }
 
     EnterCriticalSection(&g_stateLock);
-    const bool final_has_license = g_licenseState.hasLicense;
-    const uint64_t final_expiration = g_licenseState.expiresAtUnix;
+    const bool finalHasLicense = g_licenseState.hasLicense;
+    const uint64_t finalExpiration = g_licenseState.expiresAtUnix;
     LeaveCriticalSection(&g_stateLock);
 
-    if (!final_has_license) {
+    if (!finalHasLicense) {
         *hasLicense = 0;
         *expiresAtUnix = 0;
         return ERROR_NOT_FOUND;
     }
 
     *hasLicense = 1;
-    *expiresAtUnix = static_cast<hyper>(hasCachedLicense ? cachedExpiration : final_expiration);
+    *expiresAtUnix = static_cast<hyper>(hasCachedLicense ? cachedExpiration : finalExpiration);
     return ERROR_SUCCESS;
 }
 
@@ -460,6 +945,205 @@ extern "C" error_status_t ActivateProduct(const wchar_t* activationCode) {
         return ERROR_INVALID_PARAMETER;
     }
     return ActivateLicense(activationCode) ? ERROR_SUCCESS : ERROR_INVALID_DATA;
+}
+
+extern "C" error_status_t GetAvBasesInfo(int* loaded, hyper* releaseDateUnix, unsigned long* recordCount) {
+    if (loaded == nullptr || releaseDateUnix == nullptr || recordCount == nullptr) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    EnterCriticalSection(&g_stateLock);
+    const bool authenticated = g_authState.authenticated;
+    LeaveCriticalSection(&g_stateLock);
+    if (!authenticated) {
+        return ERROR_ACCESS_DENIED;
+    }
+
+    EnterCriticalSection(&g_avLock);
+    const tray::AvBasesInfo info = g_avEngine.GetBasesInfo();
+    LeaveCriticalSection(&g_avLock);
+
+    *loaded = info.loaded ? 1 : 0;
+    *releaseDateUnix = static_cast<hyper>(info.releaseDateUnix);
+    *recordCount = info.recordCount;
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t ScanFile(const wchar_t* path,
+                                   int* malicious,
+                                   unsigned long* scannedObjects,
+                                   unsigned long* maliciousObjects,
+                                   unsigned long* failedObjects,
+                                   wchar_t* details,
+                                   unsigned long detailsCapacity) {
+    if (path == nullptr || malicious == nullptr || scannedObjects == nullptr || maliciousObjects == nullptr || failedObjects == nullptr || details == nullptr || detailsCapacity == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (!CanUseAvFeatures()) {
+        return ERROR_NOT_FOUND;
+    }
+
+    ScanSummaryInternal summary;
+    ScanSingleFileInternal(path, &summary);
+    *malicious = summary.maliciousObjects != 0 ? 1 : 0;
+    *scannedObjects = summary.scannedObjects;
+    *maliciousObjects = summary.maliciousObjects;
+    *failedObjects = summary.failedObjects;
+    const std::wstring text = summary.failedObjects != 0
+        ? BuildScanSummaryText(L"Сканирование файла завершено.", summary)
+        : (summary.maliciousObjects != 0
+            ? BuildScanSummaryText(L"Сканирование файла завершено.", summary)
+            : (std::wstring(path) + L" -> чисто"));
+    FillDetailsBuffer(text, details, detailsCapacity);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t ScanDirectory(const wchar_t* path,
+                                        unsigned long* scannedObjects,
+                                        unsigned long* maliciousObjects,
+                                        unsigned long* failedObjects,
+                                        wchar_t* details,
+                                        unsigned long detailsCapacity) {
+    if (path == nullptr || scannedObjects == nullptr || maliciousObjects == nullptr || failedObjects == nullptr || details == nullptr || detailsCapacity == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (!CanUseAvFeatures()) {
+        return ERROR_NOT_FOUND;
+    }
+
+    ScanSummaryInternal summary;
+    ScanDirectoryInternal(path, &summary);
+    *scannedObjects = summary.scannedObjects;
+    *maliciousObjects = summary.maliciousObjects;
+    *failedObjects = summary.failedObjects;
+    FillDetailsBuffer(BuildScanSummaryText(L"Сканирование папки завершено.", summary), details, detailsCapacity);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t ScanFixedDrives(unsigned long* scannedObjects,
+                                          unsigned long* maliciousObjects,
+                                          unsigned long* failedObjects,
+                                          wchar_t* details,
+                                          unsigned long detailsCapacity) {
+    if (scannedObjects == nullptr || maliciousObjects == nullptr || failedObjects == nullptr || details == nullptr || detailsCapacity == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (!CanUseAvFeatures()) {
+        return ERROR_NOT_FOUND;
+    }
+
+    ScanSummaryInternal summary;
+    ScanFixedDrivesInternal(&summary);
+    *scannedObjects = summary.scannedObjects;
+    *maliciousObjects = summary.maliciousObjects;
+    *failedObjects = summary.failedObjects;
+    FillDetailsBuffer(BuildScanSummaryText(L"Сканирование дисков завершено.", summary), details, detailsCapacity);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t StartScanDirectory(const wchar_t* path) {
+    if (path == nullptr || path[0] == L'\0') {
+        return ERROR_INVALID_PARAMETER;
+    }
+    return StartAsyncScanJob(ScanJobKind::Directory, path);
+}
+
+extern "C" error_status_t StartScanFixedDrives() {
+    return StartAsyncScanJob(ScanJobKind::FixedDrives, L"");
+}
+
+extern "C" error_status_t GetScanProgress(int* running,
+                                          int* hasResult,
+                                          unsigned long* totalObjects,
+                                          unsigned long* completedObjects,
+                                          unsigned long* maliciousObjects,
+                                          unsigned long* failedObjects,
+                                          wchar_t* currentPath,
+                                          unsigned long currentPathCapacity,
+                                          wchar_t* details,
+                                          unsigned long detailsCapacity) {
+    if (running == nullptr || hasResult == nullptr || totalObjects == nullptr || completedObjects == nullptr ||
+        maliciousObjects == nullptr || failedObjects == nullptr || currentPath == nullptr || currentPathCapacity == 0 ||
+        details == nullptr || detailsCapacity == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    EnterCriticalSection(&g_scanLock);
+    *running = g_scanJobState.running ? 1 : 0;
+    *hasResult = g_scanJobState.hasResult ? 1 : 0;
+    *totalObjects = g_scanJobState.totalObjects;
+    *completedObjects = g_scanJobState.completedObjects;
+    *maliciousObjects = g_scanJobState.maliciousObjects;
+    *failedObjects = g_scanJobState.failedObjects;
+    wcsncpy_s(currentPath, currentPathCapacity, g_scanJobState.currentPath.c_str(), _TRUNCATE);
+    wcsncpy_s(details, detailsCapacity, g_scanJobState.details.c_str(), _TRUNCATE);
+    LeaveCriticalSection(&g_scanLock);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t SetScheduledScan(int enabled, unsigned long intervalMinutes) {
+    if (intervalMinutes == 0) {
+        intervalMinutes = 1;
+    }
+
+    EnterCriticalSection(&g_avLock);
+    g_scheduleState.enabled = enabled != 0;
+    g_scheduleState.intervalMinutes = intervalMinutes;
+    g_scheduleState.nextRunUnix = g_scheduleState.enabled ? NowUnix() + static_cast<uint64_t>(intervalMinutes) * 60 : 0;
+    LeaveCriticalSection(&g_avLock);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t GetScheduledScan(int* enabled, unsigned long* intervalMinutes, hyper* nextRunUnix) {
+    if (enabled == nullptr || intervalMinutes == nullptr || nextRunUnix == nullptr) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    EnterCriticalSection(&g_avLock);
+    *enabled = g_scheduleState.enabled ? 1 : 0;
+    *intervalMinutes = g_scheduleState.intervalMinutes;
+    *nextRunUnix = static_cast<hyper>(g_scheduleState.nextRunUnix);
+    LeaveCriticalSection(&g_avLock);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t AddMonitorDirectory(const wchar_t* path) {
+    if (path == nullptr || path[0] == L'\0') {
+        return ERROR_INVALID_PARAMETER;
+    }
+    std::error_code error;
+    if (!fs::exists(path, error) || !fs::is_directory(path, error)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+
+    EnterCriticalSection(&g_avLock);
+    const std::wstring directory = path;
+    if (std::find(g_monitorState.directories.begin(), g_monitorState.directories.end(), directory) == g_monitorState.directories.end()) {
+        g_monitorState.directories.push_back(directory);
+    }
+    LeaveCriticalSection(&g_avLock);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t ClearMonitorDirectories() {
+    EnterCriticalSection(&g_avLock);
+    g_monitorState.directories.clear();
+    g_monitorState.knownWriteTimes.clear();
+    g_monitorState.lastSummary.clear();
+    LeaveCriticalSection(&g_avLock);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t GetMonitorDirectories(wchar_t* buffer, unsigned long bufferCapacity) {
+    if (buffer == nullptr || bufferCapacity == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    EnterCriticalSection(&g_avLock);
+    const std::wstring joined = JoinDirectories(g_monitorState.directories);
+    LeaveCriticalSection(&g_avLock);
+    wcsncpy_s(buffer, bufferCapacity, joined.c_str(), _TRUNCATE);
+    return ERROR_SUCCESS;
 }
 
 DWORD WINAPI ServiceControlHandler(DWORD control, DWORD eventType, LPVOID eventData, LPVOID) {
@@ -514,6 +1198,8 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
 
     InitializeCriticalSection(&g_processLock);
     InitializeCriticalSection(&g_stateLock);
+    InitializeCriticalSection(&g_avLock);
+    InitializeCriticalSection(&g_scanLock);
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
     SetServiceState(SERVICE_START_PENDING, NO_ERROR, 3000);
@@ -523,6 +1209,8 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
         if (g_stopEvent != nullptr) {
             CloseHandle(g_stopEvent);
         }
+        DeleteCriticalSection(&g_avLock);
+        DeleteCriticalSection(&g_scanLock);
         DeleteCriticalSection(&g_stateLock);
         DeleteCriticalSection(&g_processLock);
         return;
@@ -547,11 +1235,25 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
         WaitForSingleObject(g_stateWatchThread, 5000);
         CloseHandle(g_stateWatchThread);
     }
+    EnterCriticalSection(&g_scanLock);
+    HANDLE scanThread = g_scanJobThread;
+    LeaveCriticalSection(&g_scanLock);
+    if (scanThread != nullptr) {
+        WaitForSingleObject(scanThread, 5000);
+        CloseHandle(scanThread);
+        EnterCriticalSection(&g_scanLock);
+        if (g_scanJobThread == scanThread) {
+            g_scanJobThread = nullptr;
+        }
+        LeaveCriticalSection(&g_scanLock);
+    }
     TerminateLaunchedProcesses();
     RpcServerUnregisterIf(TrayServiceRpc_v1_0_s_ifspec, nullptr, FALSE);
     if (g_stopEvent != nullptr) {
         CloseHandle(g_stopEvent);
     }
+    DeleteCriticalSection(&g_avLock);
+    DeleteCriticalSection(&g_scanLock);
     DeleteCriticalSection(&g_stateLock);
     DeleteCriticalSection(&g_processLock);
     SetServiceState(SERVICE_STOPPED);
@@ -569,3 +1271,4 @@ int wmain() {
     }
     return 0;
 }
+
