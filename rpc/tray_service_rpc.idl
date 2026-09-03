@@ -1,0 +1,106 @@
+﻿[
+    uuid(4FB6A677-3F42-4A1E-90A9-BD40DB95BAFD),
+    version(1.0),
+    implicit_handle(handle_t tray_service_binding),
+    pointer_default(unique)
+]
+interface TrayServiceRpc
+{
+    error_status_t StopService();
+
+    error_status_t GetCurrentUserInfo(
+        [out] int* authenticated,
+        [out, string, size_is(userNameCapacity)] wchar_t* userName,
+        [in] unsigned long userNameCapacity
+    );
+
+    error_status_t LoginUser(
+        [in, string] const wchar_t* userName,
+        [in, string] const wchar_t* password
+    );
+
+    error_status_t LogoutUser();
+
+    error_status_t GetLicenseInfo(
+        [out] int* hasLicense,
+        [out] hyper* expiresAtUnix
+    );
+
+    error_status_t ActivateProduct(
+        [in, string] const wchar_t* activationCode
+    );
+
+    error_status_t GetAvBasesInfo(
+        [out] int* loaded,
+        [out] hyper* releaseDateUnix,
+        [out] unsigned long* recordCount
+    );
+
+    error_status_t ScanFile(
+        [in, string] const wchar_t* path,
+        [out] int* malicious,
+        [out] unsigned long* scannedObjects,
+        [out] unsigned long* maliciousObjects,
+        [out] unsigned long* failedObjects,
+        [out, string, size_is(detailsCapacity)] wchar_t* details,
+        [in] unsigned long detailsCapacity
+    );
+
+    error_status_t ScanDirectory(
+        [in, string] const wchar_t* path,
+        [out] unsigned long* scannedObjects,
+        [out] unsigned long* maliciousObjects,
+        [out] unsigned long* failedObjects,
+        [out, string, size_is(detailsCapacity)] wchar_t* details,
+        [in] unsigned long detailsCapacity
+    );
+
+    error_status_t ScanFixedDrives(
+        [out] unsigned long* scannedObjects,
+        [out] unsigned long* maliciousObjects,
+        [out] unsigned long* failedObjects,
+        [out, string, size_is(detailsCapacity)] wchar_t* details,
+        [in] unsigned long detailsCapacity
+    );
+
+    error_status_t StartScanDirectory(
+        [in, string] const wchar_t* path
+    );
+
+    error_status_t StartScanFixedDrives();
+
+    error_status_t GetScanProgress(
+        [out] int* running,
+        [out] int* hasResult,
+        [out] unsigned long* totalObjects,
+        [out] unsigned long* completedObjects,
+        [out] unsigned long* maliciousObjects,
+        [out] unsigned long* failedObjects,
+        [out, string, size_is(currentPathCapacity)] wchar_t* currentPath,
+        [in] unsigned long currentPathCapacity,
+        [out, string, size_is(detailsCapacity)] wchar_t* details,
+        [in] unsigned long detailsCapacity
+    );
+
+    error_status_t SetScheduledScan(
+        [in] int enabled,
+        [in] unsigned long intervalMinutes
+    );
+
+    error_status_t GetScheduledScan(
+        [out] int* enabled,
+        [out] unsigned long* intervalMinutes,
+        [out] hyper* nextRunUnix
+    );
+
+    error_status_t AddMonitorDirectory(
+        [in, string] const wchar_t* path
+    );
+
+    error_status_t ClearMonitorDirectories();
+
+    error_status_t GetMonitorDirectories(
+        [out, string, size_is(bufferCapacity)] wchar_t* buffer,
+        [in] unsigned long bufferCapacity
+    );
+}

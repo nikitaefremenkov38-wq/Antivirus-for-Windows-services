@@ -1,0 +1,11 @@
+.idea/
+build/
+cmake-build-*/
+out/
+*.obj
+*.pdb
+*.ilk
+*.vcxproj.user
+*.sln.docstates
+tools/mock_api/localhost-cert.pem
+tools/mock_api/localhost-key.pem
